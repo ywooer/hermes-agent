@@ -185,6 +185,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
 
+        if deliver_type == "http":
+            return await self._deliver_http(chat_id, content, delivery)
+
         # Cross-platform delivery — any platform with a gateway adapter
         if self.gateway_runner and deliver_type in (
             "telegram",
@@ -670,3 +673,114 @@ class WebhookAdapter(BasePlatformAdapter):
             metadata = {"thread_id": thread_id}
 
         return await adapter.send(chat_id, content, metadata=metadata)
+
+    async def _deliver_http(
+        self, chat_id: str, content: str, delivery: dict
+    ) -> SendResult:
+        """POST agent response to a custom HTTP endpoint.
+
+        Config (in deliver_extra):
+          url        (str, required)  Target URL.
+          method     (str)            HTTP method, default POST.
+          headers    (dict)           Extra HTTP headers.
+          secret     (str)            HMAC-SHA256 signing secret.
+                                     Signature is sent as X-Hermes-Signature.
+          passthrough (bool)          Include original webhook payload as-is
+                                     under the "payload" key.
+          timeout    (int)            Request timeout in seconds, default 30.
+
+        Non-reserved keys in deliver_extra are placed in body["extra"].
+        """
+        import asyncio as _aio
+
+        extra = delivery.get("deliver_extra", {})
+        url = extra.get("url", "")
+        if not url:
+            logger.error("[webhook] http delivery missing url")
+            return SendResult(success=False, error="Missing url")
+
+        method = (extra.get("method") or "POST").upper()
+        headers: Dict[str, str] = dict(extra.get("headers") or {})
+        secret = extra.get("secret", "")
+        passthrough = extra.get("passthrough", False)
+        timeout = int(extra.get("timeout", 30))
+
+        # Reserved keys that should NOT appear in body.extra
+        _RESERVED = {"url", "method", "headers", "secret", "passthrough", "timeout"}
+        user_extra = {k: v for k, v in extra.items() if k not in _RESERVED}
+
+        # Parse route and delivery_id from chat_id: "webhook:{route}:{id}"
+        parts = chat_id.split(":", 2)
+        route_name = parts[1] if len(parts) > 1 else ""
+        delivery_id = parts[2] if len(parts) > 2 else ""
+
+        # Build body
+        body: Dict[str, Any] = {
+            "route": route_name,
+            "delivery_id": delivery_id,
+            "content": content,
+            "timestamp": time.time(),
+        }
+        if passthrough:
+            body["payload"] = delivery.get("payload", {})
+        if user_extra:
+            body["extra"] = user_extra
+
+        # Sign if secret is configured
+        body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        if secret:
+            sig = hmac.new(secret.encode(), body_bytes, hashlib.sha256).hexdigest()
+            headers["X-Hermes-Signature"] = f"sha256={sig}"
+
+        headers.setdefault("Content-Type", "application/json")
+
+        try:
+            async with _aio.timeout(timeout):
+                if not AIOHTTP_AVAILABLE:
+                    # Fallback: synchronous via urllib
+                    import urllib.request
+                    req = urllib.request.Request(
+                        url, data=body_bytes, headers=headers, method=method
+                    )
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        status = resp.status
+                        resp_body = resp.read().decode()[:500]
+                else:
+                    client_session = extra.get("_aiohttp_session")
+                    if client_session:
+                        async with client_session.request(
+                            method, url, data=body_bytes, headers=headers
+                        ) as resp:
+                            status = resp.status
+                            resp_body = (await resp.text())[:500]
+                    else:
+                        # One-shot request (no persistent session)
+                        import aiohttp
+                        async with aiohttp.ClientSession() as session:
+                            async with session.request(
+                                method, url, data=body_bytes, headers=headers
+                            ) as resp:
+                                status = resp.status
+                                resp_body = (await resp.text())[:500]
+
+            if 200 <= status < 300:
+                logger.info(
+                    "[webhook] http delivery OK %s %s -> %d",
+                    method, url, status,
+                )
+                return SendResult(success=True)
+            else:
+                logger.warning(
+                    "[webhook] http delivery failed %s %s -> %d: %s",
+                    method, url, status, resp_body,
+                )
+                return SendResult(
+                    success=False,
+                    error=f"HTTP {status}: {resp_body}",
+                )
+        except _aio.TimeoutError:
+            logger.error("[webhook] http delivery timeout %s %s", method, url)
+            return SendResult(success=False, error=f"Timeout ({timeout}s)")
+        except Exception as e:
+            logger.error("[webhook] http delivery error: %s", e)
+            return SendResult(success=False, error=str(e))
